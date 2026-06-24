@@ -1,5 +1,35 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## OnlyMonster webhooks
+
+Configure the webhook signing secret on the server:
+
+```bash
+ONLYMONSTER_WEBHOOK_SECRET=your_webhook_secret
+```
+
+Use this public URL in OnlyMonster:
+
+```text
+https://TU-DOMINIO.vercel.app/api/webhooks/onlymonster
+```
+
+The app validates:
+
+- `x-om-webhook-signature`
+- `x-om-webhook-timestamp`
+- `x-om-webhook-id`
+
+Signature format:
+
+```text
+signedContent = `${timestamp}.${rawBody}`
+expected = HMAC-SHA256(signedContent, ONLYMONSTER_WEBHOOK_SECRET)
+```
+
+Recent webhook events can be inspected at `/webhooks-debug`. The webhook handler
+does not call OpenAI and does not store API keys or secrets in the frontend.
+
 ## Getting Started
 
 First, run the development server:
