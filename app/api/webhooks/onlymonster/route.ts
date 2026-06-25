@@ -1,5 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { addWebhookEvent } from "./store";
+import { clearAnalyzeResultCache } from "../../analyze/cache";
+import { invalidateFullContextCache } from "../../onlymonster/chats/full-context/cache";
 
 export const runtime = "nodejs";
 
@@ -212,6 +214,11 @@ export async function POST(request: Request) {
   });
 
   addWebhookEvent(event);
+  invalidateFullContextCache({
+    accountId: event.account_id,
+    fanId: event.fan_id,
+  });
+  clearAnalyzeResultCache();
 
   if (handledEvents.has(event.type)) {
     console.info("OnlyMonster webhook received", {

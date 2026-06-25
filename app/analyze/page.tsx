@@ -29,6 +29,8 @@ type AnalysisResult = {
     personalizedSuggestedMessage: string;
   };
   missingData: string;
+  requestId?: string;
+  warnings?: string[];
 };
 
 const purchaseBreakdownLabels: Record<string, string> = {
@@ -88,7 +90,18 @@ export default function AnalyzePage() {
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || "No se pudo analizar la conversación.");
+        const devRequestId =
+          process.env.NODE_ENV === "development" && data.requestId
+            ? ` ID de diagnóstico: ${data.requestId}.`
+            : "";
+        const detail =
+          process.env.NODE_ENV === "development" && data.detail
+            ? ` Detalle: ${data.detail}`
+            : "";
+
+        throw new Error(
+          `${data.error || "No se pudo analizar la conversación."}${devRequestId}${detail}`,
+        );
       }
 
       setResult(data);
@@ -138,6 +151,24 @@ export default function AnalyzePage() {
 
         {result ? (
           <div className="grid gap-4 sm:grid-cols-2">
+            {result.warnings?.length ? (
+              <article className="rounded-2xl border border-yellow-300/20 bg-yellow-500/10 p-5 text-yellow-100 sm:col-span-2">
+                <h2 className="text-sm font-medium text-yellow-200/80">
+                  Aviso
+                </h2>
+                {result.warnings.map((warning) => (
+                  <p key={warning} className="mt-2">
+                    {warning}
+                  </p>
+                ))}
+                {process.env.NODE_ENV === "development" &&
+                result.requestId ? (
+                  <p className="mt-2 text-xs text-yellow-100/70">
+                    ID de diagnóstico: {result.requestId}
+                  </p>
+                ) : null}
+              </article>
+            ) : null}
             <article className="rounded-2xl border border-white/10 bg-white/5 p-5">
               <h2 className="text-sm font-medium text-zinc-400">
                 Tipo de comprador

@@ -30,6 +30,19 @@ expected = HMAC-SHA256(signedContent, ONLYMONSTER_WEBHOOK_SECRET)
 Recent webhook events can be inspected at `/webhooks-debug`. The webhook handler
 does not call OpenAI and does not store API keys or secrets in the frontend.
 
+## Fan intelligence persistence
+
+The deep fan profile and analysis cache are persisted through Vercel KV / Upstash
+Redis. Configure these server-side variables in production:
+
+```bash
+KV_REST_API_URL=your_kv_rest_url
+KV_REST_API_TOKEN=your_kv_rest_token
+```
+
+`UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` are also supported. In
+local development only, the app falls back to in-memory cache.
+
 ## Getting Started
 
 First, run the development server:

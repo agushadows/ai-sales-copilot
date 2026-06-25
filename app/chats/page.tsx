@@ -75,6 +75,8 @@ type SpendingQueueItem = {
 
 type AnalysisResult = {
   buyerType: string;
+  fanClassification?: string;
+  historicalValue?: string;
   purchaseIntentScore: number;
   purchaseIntentLabel: string;
   repurchaseProbability: number | null;
@@ -83,6 +85,17 @@ type AnalysisResult = {
   mainMotivation: string;
   mainObjection: string;
   whatThisFanAlreadyDid: string;
+  purchaseBreakdown: {
+    initialPurchase: string;
+    welcomePPV: string;
+    ppvPurchased: string;
+    tip: string;
+    subscription: string;
+    totalSpent: string;
+    purchaseCount: string;
+    lastPurchase: string;
+    purchasesAfterWelcome: string;
+  };
   nextBestAction: string;
   howToDoIt: string;
   whatToAvoid: string;
@@ -99,6 +112,48 @@ type AnalysisResult = {
     personalizedSuggestedMessage: string;
   };
   missingData: string;
+  historyUsed?: {
+    status: string;
+    messagesAnalyzed: number;
+    firstMessageAt: string | null;
+    lastMessageAt: string | null;
+    transactionsIncluded: number;
+    historicalSpendIncluded: boolean;
+    historicalBlocksSummarized: number;
+    messagePages?: number;
+    incompleteReason: string;
+    cached: boolean;
+  };
+  requestId?: string;
+  warnings?: string[];
+};
+
+type FullContext = {
+  cached?: boolean;
+  historyUsed?: {
+    status: string;
+    messagesAnalyzed: number;
+    firstMessageAt: string | null;
+    lastMessageAt: string | null;
+    messagePages?: number;
+    transactionsIncluded: number;
+    historicalSpendIncluded: boolean;
+    incompleteReason?: string;
+  };
+  messages?: Array<{
+    id: number;
+    text: string;
+    is_sent_by_me: boolean;
+    created_at: string;
+  }>;
+  transactions?: unknown[];
+  purchaseMetrics?: unknown;
+  paginationDiagnostics?: unknown;
+};
+
+type FullHistoryState = {
+  status: "idle" | "loading" | "complete" | "limited" | "error";
+  message: string;
 };
 
 const SPENDING_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
@@ -213,6 +268,52 @@ function buildSpendingCacheKey(accountId: string | undefined, fanId: string) {
   return accountId ? `${accountId}:${fanId}` : fanId;
 }
 
+function buildFullHistoryKey(accountId: string | undefined, fanId: string) {
+  return accountId ? `${accountId}:${fanId}` : fanId;
+}
+
+function decodeHtmlEntities(value: string) {
+  const entities: Record<string, string> = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: '"',
+  };
+
+  return value.replace(/&(#\d+|#x[\da-f]+|[a-z]+);/gi, (match, entity) => {
+    if (entity[0] === "#") {
+      const isHex = entity[1]?.toLowerCase() === "x";
+      const codePoint = Number.parseInt(
+        isHex ? entity.slice(2) : entity.slice(1),
+        isHex ? 16 : 10,
+      );
+
+      return Number.isNaN(codePoint) ? match : String.fromCodePoint(codePoint);
+    }
+
+    return entities[entity.toLowerCase()] || match;
+  });
+}
+
+function cleanMessagePreview(value: unknown) {
+  if (typeof value !== "string") {
+    return "[media]";
+  }
+
+  const cleanedValue = decodeHtmlEntities(
+    value
+      .replace(/<br\s*\/?\s*>/gi, " ")
+      .replace(/<\/p\s*>/gi, " ")
+      .replace(/<[^>]*>/g, "")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+
+  return cleanedValue || "[sin texto]";
+}
+
 function readCachedSpending(accountId: string | undefined, fanId: string) {
   if (typeof window === "undefined" || !accountId) {
     return null;
@@ -288,7 +389,18 @@ export default function ChatsPage() {
     null,
   );
   const [analysisError, setAnalysisError] = useState("");
+  const [analysisProgress, setAnalysisProgress] = useState("");
+  const [historyDiagnostic, setHistoryDiagnostic] = useState<unknown>(null);
+  const [showHistoryDiagnostic, setShowHistoryDiagnostic] = useState(false);
+  const [analyzingFanId, setAnalyzingFanId] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [fanProfilePreview, setFanProfilePreview] = useState<unknown>(null);
+  const [fullContexts, setFullContexts] = useState<Record<string, FullContext>>(
+    {},
+  );
+  const [fullHistoryStates, setFullHistoryStates] = useState<
+    Record<string, FullHistoryState>
+  >({});
   const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState("");
   const [error, setError] = useState("");
@@ -867,10 +979,85 @@ export default function ChatsPage() {
           event.account_id === accountId &&
           typeof event.fan_id === "string"
         ) {
+          const historyKey = buildFullHistoryKey(accountId, event.fan_id);
           localStorage.removeItem(
             `onlymonster_spending_${accountId}_${event.fan_id}`,
           );
           changedFanIds.push(event.fan_id);
+          setFullContexts((currentContexts) => {
+            const updatedContexts = { ...currentContexts };
+            delete updatedContexts[historyKey];
+            return updatedContexts;
+          });
+        }
+
+        if (
+          event.type === "chat.message" &&
+          event.account_id === accountId &&
+          typeof event.fan_id === "string"
+        ) {
+          const historyKey = buildFullHistoryKey(accountId, event.fan_id);
+          const payload =
+            typeof event.payload === "object" && event.payload !== null
+              ? (event.payload as Record<string, unknown>)
+              : {};
+          const nextLastMessage = cleanMessagePreview(payload.text);
+          const nextLastMessageDate =
+            typeof payload.created_at === "string"
+              ? payload.created_at
+              : new Date().toISOString();
+
+          setFanSummaries((currentSummaries) => {
+            const currentSummary = currentSummaries[event.fan_id] || {
+              fanId: event.fan_id,
+              label: buildFanLabel(event.fan_id),
+              name: null,
+              username: null,
+              lastMessage: "Sin mensaje",
+              lastMessageDate: null,
+              totalSpent: null,
+            };
+            const updatedSummaries = {
+              ...currentSummaries,
+              [event.fan_id]: {
+                ...currentSummary,
+                lastMessage: nextLastMessage,
+                lastMessageDate: nextLastMessageDate,
+              },
+            };
+
+            localStorage.setItem(
+              "onlymonster_fan_summaries",
+              JSON.stringify(updatedSummaries),
+            );
+
+            return updatedSummaries;
+          });
+          setFanIds((currentFanIds) => {
+            const updatedFanIds = [
+              event.fan_id,
+              ...currentFanIds.filter((fanId) => fanId !== event.fan_id),
+            ].map(String);
+
+            localStorage.setItem(
+              `onlymonster_fan_ids_${accountId}`,
+              JSON.stringify(updatedFanIds),
+            );
+
+            return updatedFanIds;
+          });
+          setFullContexts((currentContexts) => {
+            const updatedContexts = { ...currentContexts };
+            delete updatedContexts[historyKey];
+            return updatedContexts;
+          });
+          setFullHistoryStates((currentStates) => ({
+            ...currentStates,
+            [historyKey]: {
+              status: "idle",
+              message: "",
+            },
+          }));
         }
       }
 
@@ -1062,7 +1249,9 @@ export default function ChatsPage() {
         ),
         name: data.fan?.name || null,
         username: data.fan?.username || null,
-        lastMessage: lastMessage?.text || "Sin mensaje",
+        lastMessage: lastMessage
+          ? cleanMessagePreview(lastMessage.text)
+          : "Sin mensaje",
         lastMessageDate: lastMessage?.created_at || null,
         totalSpent:
           typeof data.totalSpent === "number" ? data.totalSpent : null,
@@ -1158,6 +1347,132 @@ export default function ChatsPage() {
     setAliasDraft("");
   }
 
+  async function loadFullHistoryForFan({
+    fanId,
+    showInChat,
+  }: {
+    fanId: string;
+    showInChat: boolean;
+  }) {
+    if (!account || !apiKey) {
+      throw new Error("Conecta OnlyMonster antes de cargar el historial.");
+    }
+
+    const historyKey = buildFullHistoryKey(account.id, fanId);
+    const cachedContext = fullContexts[historyKey];
+
+    if (cachedContext) {
+      return cachedContext;
+    }
+
+    setFullHistoryStates((currentStates) => ({
+      ...currentStates,
+      [historyKey]: {
+        status: "loading",
+        message: "Cargando historial completo... página 1",
+      },
+    }));
+
+    const params = new URLSearchParams({
+      accountId: account.id,
+      fanId,
+      platform: account.platform || "onlyfans",
+      platformAccountId: account.platform_account_id,
+    });
+    const response = await fetch(`/api/onlymonster/chats/full-context?${params}`, {
+      headers: {
+        "x-om-auth-token": apiKey,
+      },
+    });
+    const fullContext = (await response.json()) as FullContext & {
+      error?: string;
+    };
+
+    if (!response.ok) {
+      setFullHistoryStates((currentStates) => ({
+        ...currentStates,
+        [historyKey]: {
+          status: "error",
+          message: fullContext.error || "No se pudo cargar el historial completo.",
+        },
+      }));
+      throw new Error(
+        fullContext.error || "No se pudo cargar el historial completo.",
+      );
+    }
+
+    setFullContexts((currentContexts) => ({
+      ...currentContexts,
+      [historyKey]: fullContext,
+    }));
+    setHistoryDiagnostic(fullContext.paginationDiagnostics || null);
+
+    const fullMessages = (fullContext.messages || []).map((message) => ({
+      id: message.id,
+      text: message.text || "[sin texto]",
+      is_sent_by_me: message.is_sent_by_me,
+      created_at: message.created_at,
+    }));
+
+    if (showInChat) {
+      setMessages(fullMessages);
+      localStorage.setItem(
+        `onlymonster_messages_${fanId}`,
+        JSON.stringify(fullMessages),
+      );
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => scrollToLastMessage("auto"));
+      });
+    }
+
+    if (fullMessages.length > 0) {
+      const lastMessage = fullMessages[fullMessages.length - 1];
+      setFanSummaries((currentSummaries) => {
+        const currentSummary = currentSummaries[fanId] || {
+          fanId,
+          label: buildFanLabel(fanId),
+          name: null,
+          username: null,
+          lastMessage: "Sin mensaje",
+          lastMessageDate: null,
+          totalSpent: null,
+        };
+        const updatedSummaries = {
+          ...currentSummaries,
+          [fanId]: {
+            ...currentSummary,
+            lastMessage: cleanMessagePreview(lastMessage.text),
+            lastMessageDate: lastMessage.created_at,
+          },
+        };
+
+        localStorage.setItem(
+          "onlymonster_fan_summaries",
+          JSON.stringify(updatedSummaries),
+        );
+
+        return updatedSummaries;
+      });
+    }
+
+    const status =
+      fullContext.historyUsed?.status === "completo" ? "complete" : "limited";
+    const message =
+      status === "complete"
+        ? `Historial completo cargado: ${fullContext.historyUsed?.messagesAnalyzed || fullMessages.length} mensajes`
+        : `Historial limitado: ${fullContext.historyUsed?.messagesAnalyzed || fullMessages.length} mensajes`;
+
+    setFullHistoryStates((currentStates) => ({
+      ...currentStates,
+      [historyKey]: {
+        status,
+        message,
+      },
+    }));
+
+    return fullContext;
+  }
+
   async function analyzeConversation() {
     const formattedConversation = messages
       .map((message) => {
@@ -1195,7 +1510,16 @@ export default function ChatsPage() {
 
     setAnalysisError("");
     setAnalysisResult(null);
+    setAnalysisProgress("");
+    setHistoryDiagnostic(null);
+    setShowHistoryDiagnostic(false);
+    setFanProfilePreview(null);
     setCopyFeedback("");
+
+    if (!selectedFanId || !account || !apiKey) {
+      setAnalysisError("Conecta OnlyMonster y selecciona un fan antes de analizar.");
+      return;
+    }
 
     if (!formattedConversation.trim()) {
       setAnalysisError("No hay mensajes para analizar.");
@@ -1203,9 +1527,47 @@ export default function ChatsPage() {
     }
 
     setIsAnalyzing(true);
+    setAnalyzingFanId(selectedFanId);
     setShowAnalysisPanel(true);
 
     try {
+      const profileParams = new URLSearchParams({
+        accountId: account.id,
+        fanId: selectedFanId,
+      });
+      fetch(`/api/analyze/profile?${profileParams}`)
+        .then((profileResponse) => profileResponse.json())
+        .then((profileData) => {
+          if (profileData.profile?.profile) {
+            setFanProfilePreview(profileData.profile.profile);
+            setAnalysisProgress("Perfil profundo cargado. Actualizando con mensajes recientes...");
+          }
+        })
+        .catch(() => undefined);
+      const historyKey = buildFullHistoryKey(account.id, selectedFanId);
+      const cachedFullContext = fullContexts[historyKey];
+
+      setAnalysisProgress(
+        cachedFullContext
+          ? "Usando caché histórica..."
+          : "Recopilando historial...",
+      );
+      const fullContext =
+        cachedFullContext ||
+        (await loadFullHistoryForFan({
+          fanId: selectedFanId,
+          showInChat: false,
+        }));
+
+      setHistoryDiagnostic(fullContext.paginationDiagnostics || null);
+      setAnalysisProgress(
+        fullContext.cached || cachedFullContext
+          ? "Usando caché histórica... Generando recomendación final..."
+          : (fullContext.messages?.length || 0) > 220
+            ? `Resumiendo bloques nuevos del historial (${fullContext.historyUsed?.messagesAnalyzed || 0} mensajes)...`
+            : `Historial recopilado: ${fullContext.historyUsed?.messagesAnalyzed || 0} mensajes. Generando recomendación final...`,
+      );
+
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: {
@@ -1215,12 +1577,24 @@ export default function ChatsPage() {
           conversationText: formattedConversation,
           sector: "OnlyFans",
           fanMetadata,
+          fullContext,
         }),
       });
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || "No se pudo analizar la conversación.");
+        const devRequestId =
+          process.env.NODE_ENV === "development" && data.requestId
+            ? ` ID de diagnóstico: ${data.requestId}.`
+            : "";
+        const detail =
+          process.env.NODE_ENV === "development" && data.detail
+            ? ` Detalle: ${data.detail}`
+            : "";
+
+        throw new Error(
+          `${data.error || "No se pudo analizar la conversación."}${devRequestId}${detail}`,
+        );
       }
 
       setAnalysisResult(data);
@@ -1233,6 +1607,8 @@ export default function ChatsPage() {
       );
     } finally {
       setIsAnalyzing(false);
+      setAnalyzingFanId("");
+      setAnalysisProgress("");
     }
   }
 
@@ -1247,7 +1623,7 @@ export default function ChatsPage() {
   }
 
   const analysisPanel = (
-    <div className="flex h-full min-h-0 flex-col rounded-2xl border border-white/10 bg-white/5 p-5">
+    <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden rounded-2xl border border-white/10 bg-white/5 p-5">
       <div className="flex shrink-0 items-center justify-between gap-3">
         <div>
           <h3 className="text-lg font-semibold text-white">Análisis IA</h3>
@@ -1264,7 +1640,7 @@ export default function ChatsPage() {
         </button>
       </div>
 
-      <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+      <div className="mt-4 min-h-0 flex-1 overflow-y-auto overflow-x-hidden pr-1">
         {!isAnalyzing && !analysisError && !analysisResult ? (
           <p className="rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-zinc-300">
             Pulsa Analizar conversación para generar recomendaciones.
@@ -1273,7 +1649,7 @@ export default function ChatsPage() {
 
         {isAnalyzing ? (
           <p className="rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-zinc-300">
-            Analizando…
+            {analysisProgress || "Analizando historial completo..."}
           </p>
         ) : null}
 
@@ -1283,12 +1659,138 @@ export default function ChatsPage() {
           </div>
         ) : null}
 
+        {fanProfilePreview && !analysisResult ? (
+          <div className="min-w-0 rounded-2xl border border-white/10 bg-black/20 p-4 text-sm leading-relaxed text-zinc-200 break-words">
+            <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+              Perfil profundo existente
+            </p>
+            <pre className="mt-3 max-h-96 overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-words text-xs leading-relaxed text-zinc-200">
+              {JSON.stringify(fanProfilePreview, null, 2)}
+            </pre>
+          </div>
+        ) : null}
+
         {analysisResult ? (
-          <div className="grid gap-3 text-sm text-zinc-200">
+          <div className="grid min-w-0 gap-3 text-sm leading-relaxed text-zinc-200 break-words whitespace-normal [&>div]:rounded-2xl [&>div]:border [&>div]:border-white/10 [&>div]:bg-black/20 [&>div]:p-4">
+            {analysisResult.warnings?.length ? (
+              <div className="border-yellow-300/20 bg-yellow-500/10 text-yellow-100">
+                <p className="text-xs font-semibold uppercase tracking-wide text-yellow-200/80">
+                  Aviso
+                </p>
+                {analysisResult.warnings.map((warning) => (
+                  <p key={warning} className="mt-2">
+                    {warning}
+                  </p>
+                ))}
+                {process.env.NODE_ENV === "development" &&
+                analysisResult.requestId ? (
+                  <p className="mt-2 text-xs text-yellow-100/70">
+                    ID de diagnóstico: {analysisResult.requestId}
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                Resumen
+              </p>
+              <p className="mt-2 text-zinc-300">
+                {analysisResult.shortReasoning}
+              </p>
+            </div>
+            {analysisResult.historyUsed ? (
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                  Historial usado
+                </p>
+                <p className="mt-2 text-zinc-300">
+                  {analysisResult.historyUsed.status === "completo"
+                    ? "Completo"
+                    : analysisResult.historyUsed.status === "incompleto"
+                      ? `Historial incompleto: se recuperaron ${analysisResult.historyUsed.messagesAnalyzed} mensajes hasta ${
+                          analysisResult.historyUsed.firstMessageAt
+                            ? formatDate(
+                                analysisResult.historyUsed.firstMessageAt,
+                              )
+                            : "fecha no disponible"
+                        }.`
+                      : analysisResult.historyUsed.status}
+                </p>
+                <p className="mt-1 text-zinc-400">
+                  {analysisResult.historyUsed.messagesAnalyzed} mensajes ·{" "}
+                  {analysisResult.historyUsed.firstMessageAt
+                    ? formatDate(analysisResult.historyUsed.firstMessageAt)
+                    : "inicio no disponible"}{" "}
+                  →{" "}
+                  {analysisResult.historyUsed.lastMessageAt
+                    ? formatDate(analysisResult.historyUsed.lastMessageAt)
+                    : "fin no disponible"}
+                </p>
+                <p className="mt-1 text-zinc-400">
+                  {analysisResult.historyUsed.messagePages || 0} páginas de
+                  mensajes recuperadas
+                </p>
+                <p className="mt-1 text-zinc-400">
+                  {analysisResult.historyUsed.transactionsIncluded}{" "}
+                  transacciones ·{" "}
+                  {analysisResult.historyUsed.historicalSpendIncluded
+                    ? "gasto histórico incluido"
+                    : "datos de compra no disponibles"}
+                </p>
+                {analysisResult.historyUsed.historicalBlocksSummarized > 0 ? (
+                  <p className="mt-1 text-zinc-400">
+                    {analysisResult.historyUsed.historicalBlocksSummarized}{" "}
+                    bloques históricos resumidos
+                  </p>
+                ) : null}
+                {analysisResult.historyUsed.cached ? (
+                  <p className="mt-1 text-xs text-zinc-500">
+                    Reutilizado desde caché reciente.
+                  </p>
+                ) : null}
+                {analysisResult.historyUsed.incompleteReason ? (
+                  <p className="mt-2 text-xs text-yellow-200">
+                    {analysisResult.historyUsed.incompleteReason}
+                  </p>
+                ) : null}
+                {historyDiagnostic ? (
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setShowHistoryDiagnostic((isVisible) => !isVisible)
+                      }
+                      className="rounded-full border border-white/20 px-3 py-1.5 text-xs font-semibold text-zinc-100 transition hover:bg-white/10"
+                    >
+                      Ver diagnóstico historial
+                    </button>
+                    {showHistoryDiagnostic ? (
+                      <pre className="mt-3 max-h-72 overflow-auto rounded-xl border border-white/10 bg-black/40 p-3 text-xs leading-5 text-zinc-200">
+                        {JSON.stringify(historyDiagnostic, null, 2)}
+                      </pre>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             <div>
               <p className="text-zinc-500">Tipo de comprador</p>
               <p className="font-semibold">{analysisResult.buyerType}</p>
             </div>
+            {analysisResult.fanClassification ? (
+              <div>
+                <p className="text-zinc-500">Clasificación histórica</p>
+                <p className="font-semibold">
+                  {analysisResult.fanClassification}
+                </p>
+              </div>
+            ) : null}
+            {analysisResult.historicalValue ? (
+              <div>
+                <p className="text-zinc-500">Valor histórico</p>
+                <p>{analysisResult.historicalValue}</p>
+              </div>
+            ) : null}
             <div>
               <p className="text-zinc-500">Intención</p>
               <p className="font-semibold">
@@ -1319,6 +1821,28 @@ export default function ChatsPage() {
               </p>
             </div>
             <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                Compras
+              </p>
+              <dl className="mt-2 space-y-2">
+                <div>
+                  <dt className="text-zinc-500">Gasto total</dt>
+                  <dd>{analysisResult.purchaseBreakdown.totalSpent}</dd>
+                </div>
+                <div>
+                  <dt className="text-zinc-500">Compras</dt>
+                  <dd>{analysisResult.purchaseBreakdown.purchaseCount}</dd>
+                </div>
+                <div>
+                  <dt className="text-zinc-500">Última compra</dt>
+                  <dd>{analysisResult.purchaseBreakdown.lastPurchase}</dd>
+                </div>
+              </dl>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                Recomendación
+              </p>
               <p className="text-zinc-500">Motivación</p>
               <p>{analysisResult.mainMotivation}</p>
             </div>
@@ -1347,8 +1871,10 @@ export default function ChatsPage() {
               <p>${analysisResult.suggestedPPVPrice}</p>
             </div>
             <div>
-              <p className="text-zinc-500">Mensaje sugerido</p>
-              <p className="whitespace-pre-wrap font-semibold">
+              <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                Mensaje sugerido
+              </p>
+              <p className="mt-2 whitespace-pre-wrap rounded-xl bg-white p-3 font-semibold text-zinc-950">
                 {analysisResult.suggestedMessage}
               </p>
               <div className="mt-3 flex items-center gap-3">
@@ -1365,21 +1891,23 @@ export default function ChatsPage() {
               </div>
             </div>
             <div>
-              <p className="text-zinc-500">Evidencias</p>
+              <p className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                Evidencias
+              </p>
               <dl className="mt-2 space-y-2">
-                <div>
+                <div className="min-w-0">
                   <dt className="text-zinc-500">Señal observada</dt>
                   <dd>{analysisResult.recommendation.observedSignal}</dd>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <dt className="text-zinc-500">Interpretación</dt>
                   <dd>{analysisResult.recommendation.interpretation}</dd>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <dt className="text-zinc-500">Por qué esa acción</dt>
                   <dd>{analysisResult.recommendation.whyThisAction}</dd>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <dt className="text-zinc-500">Razonamiento breve</dt>
                   <dd>{analysisResult.shortReasoning}</dd>
                 </div>
@@ -1391,7 +1919,9 @@ export default function ChatsPage() {
               disabled={messages.length === 0 || isAnalyzing}
               className="mt-2 rounded-full border border-white/20 px-4 py-2 text-xs font-semibold text-zinc-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {isAnalyzing ? "Regenerando..." : "Regenerar análisis"}
+              {isAnalyzing && analyzingFanId === selectedFanId
+                ? "Regenerando..."
+                : "Regenerar análisis"}
             </button>
           </div>
         ) : null}
@@ -1575,6 +2105,12 @@ export default function ChatsPage() {
       </div>
     </div>
   ) : null;
+  const selectedHistoryKey = selectedFanId
+    ? buildFullHistoryKey(account?.id, selectedFanId)
+    : "";
+  const selectedFullHistoryState = selectedHistoryKey
+    ? fullHistoryStates[selectedHistoryKey]
+    : null;
 
   return (
     <main className="h-screen overflow-hidden bg-zinc-950 text-white">
@@ -1636,6 +2172,25 @@ export default function ChatsPage() {
               );
               const canEditAlias = !hasRealFanName(summary);
               const showFanId = hasRealFanName(summary) || Boolean(alias);
+              const lastMessagePreview = summary?.lastMessage
+                ? cleanMessagePreview(summary.lastMessage)
+                : "Sin mensaje";
+              const spendingLabel =
+                currentSpendingStatus === "loading"
+                  ? "Calculando..."
+                  : currentSpendingStatus === "error"
+                    ? "No disponible"
+                    : cachedSpending
+                      ? `$${cachedSpending.totalSpent.toFixed(2)}`
+                      : typeof summary?.totalSpent === "number"
+                        ? `$${summary.totalSpent.toFixed(2)}`
+                        : "Calculando...";
+              const dateLabel =
+                summary?.lastMessageDate && mounted
+                  ? formatDate(summary.lastMessageDate)
+                  : summary?.lastMessageDate
+                    ? "Cargando fecha..."
+                    : "Sin actividad";
 
               return (
                 <div
@@ -1687,39 +2242,12 @@ export default function ChatsPage() {
                       </button>
                     ) : null}
                   </div>
-                  <dl className="mt-1.5 grid gap-1 text-xs text-zinc-400">
-                    <div className="flex items-center justify-between gap-3">
-                      <dt className="text-zinc-500">Gasto total</dt>
-                      <dd>
-                        {currentSpendingStatus === "loading"
-                          ? "Calculando..."
-                          : currentSpendingStatus === "error"
-                            ? "No disponible"
-                            : cachedSpending
-                              ? `$${cachedSpending.totalSpent.toFixed(2)}`
-                              : typeof summary?.totalSpent === "number"
-                                ? `$${summary.totalSpent.toFixed(2)}`
-                                : "Calculando..."}
-                      </dd>
-                    </div>
-                    {summary ? (
-                      <>
-                        <div className="flex items-center justify-between gap-3">
-                          <dt className="text-zinc-500">Última actividad</dt>
-                          <dd className="truncate">
-                            {mounted
-                              ? formatDate(summary.lastMessageDate)
-                              : "Cargando fecha..."}
-                          </dd>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="flex items-center justify-between gap-3">
-                        <dt className="text-zinc-500">Última actividad</dt>
-                        <dd className="truncate">Sin actividad</dd>
-                      </div>
-                    )}
-                  </dl>
+                  <p className="mt-1 truncate text-xs text-zinc-400">
+                    Último: {lastMessagePreview}
+                  </p>
+                  <p className="mt-0.5 truncate text-xs text-zinc-500">
+                    {spendingLabel} · {dateLabel}
+                  </p>
                   {loadingFanId === fanId ? (
                     <div className="mt-2 h-1.5 w-2/3 animate-pulse rounded-full bg-white/20" />
                   ) : null}
@@ -1752,6 +2280,19 @@ export default function ChatsPage() {
 
                 <div className="min-h-0 flex-1 overflow-y-auto p-5 pb-28">
                   <div className="flex flex-col gap-5">
+                    {selectedFullHistoryState?.message ? (
+                      <p
+                        className={`rounded-2xl border p-3 text-sm ${
+                          selectedFullHistoryState.status === "error"
+                            ? "border-red-400/30 bg-red-500/10 text-red-100"
+                            : selectedFullHistoryState.status === "limited"
+                              ? "border-yellow-400/30 bg-yellow-500/10 text-yellow-100"
+                              : "border-white/10 bg-black/20 text-zinc-300"
+                        }`}
+                      >
+                        {selectedFullHistoryState.message}
+                      </p>
+                    ) : null}
                     {isLoadingMessages ? (
                       <p className="text-zinc-400">Cargando mensajes...</p>
                     ) : (
@@ -1810,11 +2351,40 @@ export default function ChatsPage() {
                     </button>
                     <button
                       type="button"
+                      onClick={() =>
+                        loadFullHistoryForFan({
+                          fanId: selectedFanId,
+                          showInChat: true,
+                        }).catch((historyError) =>
+                          setError(
+                            historyError instanceof Error
+                              ? historyError.message
+                              : "No se pudo cargar el historial completo.",
+                          ),
+                        )
+                      }
+                      disabled={
+                        !selectedFanId ||
+                        selectedFullHistoryState?.status === "loading" ||
+                        selectedFullHistoryState?.status === "complete"
+                      }
+                      className="rounded-full border border-white/20 px-4 py-2 text-xs font-semibold text-zinc-200 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {selectedFullHistoryState?.status === "loading"
+                        ? "Cargando historial..."
+                        : selectedFullHistoryState?.status === "complete"
+                          ? "Historial completo cargado"
+                          : "Cargar historial completo"}
+                    </button>
+                    <button
+                      type="button"
                       onClick={analyzeConversation}
                       disabled={messages.length === 0 || isAnalyzing}
                       className="rounded-full border border-white/30 px-5 py-2 text-sm font-semibold transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                      {isAnalyzing ? "Analizando..." : "Analizar conversación"}
+                      {isAnalyzing && analyzingFanId === selectedFanId
+                        ? "Analizando historial..."
+                        : "Analizar conversación"}
                     </button>
                     <button
                       type="button"
